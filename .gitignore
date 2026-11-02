@@ -5,6 +5,9 @@ __pycache__/
 #coding agents
 .claude/
 
+#Pretrained CLIP
+modules/ViT-B-32.pt
+
 
 #Virtual environments 
 VENV*/
