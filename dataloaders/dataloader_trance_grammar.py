@@ -60,6 +60,11 @@ class TRANCE_Grammar_DataLoader(TRANCE_DataLoader):
     def rules_of(self, sample_id):
         return self.groups[self.trans_id_of[sample_id]]["rules"]
 
+    def execution_samples(self):
+        """{sample_id: (trans_id, initial objects, final objects)}, the input of
+        trance_execution.execution_metrics."""
+        return {s["sample_id"]: (s["trans_id"], s["objects"], s["final_objects"]) for s in self.samples}
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
         group = self.groups[sample["trans_id"]]

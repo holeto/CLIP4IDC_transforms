@@ -149,6 +149,9 @@ def get_args(description='CLIP4IDC on Captioning Task'):
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
     add_grammar_args(parser)
+    parser.add_argument("--execution_oracle", action="store_true",
+                        help="Grammar target, check of the execution metrics: decode as usual, then score the true "
+                             "derivations in place of the decoded ones (100%% on consistent data).")
     add_trance_args(parser)
     parser.add_argument("--config", default=None, type=str,
                         help="YAML file with defaults (sections common, adaptation, finetuning; see util.py)")
@@ -572,9 +575,11 @@ def greedy_decode(args, model, tokenizer, input_ids, segment_ids, input_mask, vi
 def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
     """Decodes every test pair under --grammar_mask and compares it with the true derivation.
 
+    Also logs the execution metrics (modules/trance_execution.py): whether the decoded transformation turns
+    the pair's initial scene into its final one, and across the members of each group.
     Writes hyp_ep_<epoch>.json and returns the exact-match rate in %, which selects the best checkpoint.
     """
-    from modules import trance_grammar
+    from modules import trance_execution, trance_grammar
 
     if hasattr(model, 'module'):
         model = model.module.to(device)
@@ -582,7 +587,7 @@ def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
         model = model.to(device)
     dataset = test_dataloader.dataset
 
-    results = []
+    results, programs = [], {}
     model.eval()
     with torch.no_grad():
         for batch in test_dataloader:
@@ -590,21 +595,31 @@ def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
             _, _, _, bef_image, aft_image, image_mask = (t.to(device, non_blocking=True) for t in batch[:-1])
             maskers = [trance_grammar.make_masker(args.grammar_mask, dataset.members_of(sample_id), dataset.geometry)
                        for sample_id in sample_ids]
-            decoded = model.decode_rules(bef_image, aft_image, image_mask, maskers)
-            for sample_id, rules, masker in zip(sample_ids, decoded.tolist(), maskers):
-                program = trance_grammar.program_of_derivation(rules) if masker.done else None
+            decoded = model.decode_rules(bef_image, aft_image, image_mask, maskers).tolist()
+            if args.execution_oracle:
+                decoded = [dataset.rules_of(sample_id).tolist() for sample_id in sample_ids]
+            for sample_id, rules, masker in zip(sample_ids, decoded, maskers):
+                # A decode the mask did not finish is incomplete; the oracle's are complete.
+                done = masker.done or args.execution_oracle
+                program = trance_grammar.program_of_derivation(rules) if done else None
                 # valid in every member's scene, whichever mask decoded it
                 valid = program is not None and trance_grammar.accepts(
                     dataset.members_of(sample_id), rules, dataset.geometry)
+                programs[sample_id] = program
                 results.append({"image_id": sample_id, "rules": rules,
                                 "program": None if program is None else trance_grammar.program_text(program),
                                 "complete": program is not None, "valid": valid,
                                 "exact": rules == dataset.rules_of(sample_id).tolist()})
 
+    execution = trance_execution.execution_metrics(programs, dataset.execution_samples(), dataset.geometry)
+    for result in results:
+        result["execution"] = execution["verdicts"][result["image_id"]]
     json.dump(results, open(os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch), "w"), indent=1)
     rate = {key: 100.0 * sum(r[key] for r in results) / len(results) for key in ["exact", "valid", "complete"]}
-    logger.info(">>>  Exact match: {:.1f} - Valid in every scene: {:.1f} - Complete: {:.1f} ({} pairs, {} mask)".format(
-        rate["exact"], rate["valid"], rate["complete"], len(results), args.grammar_mask))
+    logger.info(">>>  Exact match: {:.1f} - Valid in every scene: {:.1f} - Complete: {:.1f} ({} pairs, {} mask{})".format(
+        rate["exact"], rate["valid"], rate["complete"], len(results), args.grammar_mask,
+        ", ORACLE: true derivations scored" if args.execution_oracle else ""))
+    logger.info(">>>  " + trance_execution.format_metrics(execution))
     return rate["exact"]
 
 def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, test_set=None, epoch=None):

@@ -61,8 +61,8 @@ def load_trance_split(data_path, subset, initial_camera="Camera_Center", final_c
     """Samples of one split as a list of dicts, in the order of data.jsonl.
 
     Each sample: sample_id (str of the unique idx), trans_id, member, target_id, text, bef_image,
-    aft_image (file names inside the image directory), transformations (the row's steps) and objects
-    (its stage-0 objects). target_id numbers the distinct
+    aft_image (file names inside the image directory), transformations (the row's steps), objects
+    (its stage-0 objects) and final_objects (those of its last state). target_id numbers the distinct
     `transformation_key`s of the whole file in order of first appearance, so it is the same in every split.
     With test_transformation_generalization, a transformation in two splits is an error; otherwise the
     share of the split's transformations that also occur in train is logged (for val and test).
@@ -110,6 +110,8 @@ def load_trance_split(data_path, subset, initial_camera="Camera_Center", final_c
             # read by the grammar target (dataloader_trance_grammar.py)
             "transformations": row["transformations"],
             "objects": row["states"][0].get("objects"),
+            # read by the execution check (modules/trance_execution.py)
+            "final_objects": row["states"][-1].get("objects"),
         })
 
     for trans_id, names in splits_of_trans.items():
