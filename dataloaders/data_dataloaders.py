@@ -4,6 +4,8 @@ from dataloaders.dataloader_clevr_caption import CLEVR_DataLoader as CLEVR_Capti
 from dataloaders.dataloader_spot_caption import SPOT_DataLoader as SPOT_Caption_DataLoader
 from dataloaders.dataloader_clevr_retrieval import CLEVR_DataLoader
 from dataloaders.dataloader_spot_retrieval import SPOT_DataLoader
+from dataloaders.dataloader_trance_caption import TRANCE_DataLoader as TRANCE_Caption_DataLoader
+from dataloaders.dataloader_trance_retrieval import TRANCE_DataLoader
 
 
 def dataloader_clevr_train(args, tokenizer):
@@ -105,6 +107,52 @@ def dataloader_spot_test(args, tokenizer, subset="test"):
     return dataloader_spot, len(spot_testset)
 
 
+def _trance_dataset(args, tokenizer, subset):
+    kwargs = dict(subset=subset, data_path=args.data_path, features_path=args.features_path,
+                  max_words=args.max_words, tokenizer=tokenizer,
+                  test_transformation_generalization=getattr(args, "test_transformation_generalization", False))
+    if getattr(args, "target", "text") == "grammar":
+        # imported here, so that the other datasets do not need the TRANCE grammar
+        from dataloaders.dataloader_trance_grammar import TRANCE_Grammar_DataLoader
+        return TRANCE_Grammar_DataLoader(task_type=args.task_type, grammar_mask=args.grammar_mask, **kwargs)
+    if args.task_type == "retrieval":
+        return TRANCE_DataLoader(**kwargs)
+    return TRANCE_Caption_DataLoader(**kwargs)
+
+
+def dataloader_trance_train(args, tokenizer):
+    trance_dataset = _trance_dataset(args, tokenizer, "train")
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(trance_dataset)
+    # drop_last=True would silently give an epoch of zero steps
+    if len(train_sampler) < args.batch_size // args.n_gpu:
+        raise ValueError("train split has {} samples per process, fewer than one batch of {}; lower --batch_size".format(
+            len(train_sampler), args.batch_size // args.n_gpu))
+    dataloader = DataLoader(
+        trance_dataset,
+        batch_size=args.batch_size // args.n_gpu,
+        num_workers=args.num_thread_reader,
+        pin_memory=False,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        drop_last=True,
+    )
+
+    return dataloader, len(trance_dataset), train_sampler
+
+def dataloader_trance_test(args, tokenizer, subset="test"):
+    trance_testset = _trance_dataset(args, tokenizer, subset)
+    dataloader_trance = DataLoader(
+        trance_testset,
+        batch_size=args.batch_size_val,
+        num_workers=args.num_thread_reader,
+        shuffle=False,
+        drop_last=False,
+    )
+    return dataloader_trance, len(trance_testset)
+
+
 DATALOADER_DICT = {}
 DATALOADER_DICT["clevr"] = {"train":dataloader_clevr_train, "val":dataloader_clevr_test, "test":dataloader_clevr_test}
 DATALOADER_DICT["spot"] = {"train":dataloader_spot_train, "val":dataloader_spot_test, "test":dataloader_spot_test}
+DATALOADER_DICT["trance"] = {"train":dataloader_trance_train, "val":dataloader_trance_test, "test":dataloader_trance_test}

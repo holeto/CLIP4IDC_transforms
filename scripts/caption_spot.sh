@@ -4,7 +4,7 @@ export JAVA_HOME="your_jdk/"
 export PATH=$JAVA_HOME/bin:$PATH
 
 DATA_PATH=your_data/spot-the-diff
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=5564 main_task_retrieval.py \
+python -m torch.distributed.run --nproc_per_node=1 --master_port=5564 main_task_caption.py \
 --do_train \
 --num_thread_reader=4 \
 --epochs=50 \

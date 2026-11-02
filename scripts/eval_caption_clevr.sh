@@ -1,7 +1,7 @@
 #!/bin/bash
 
 DATA_PATH=your_data/clevr_change/data
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=5557 main_task_caption.py \
+python -m torch.distributed.run --nproc_per_node=1 --master_port=5557 main_task_caption.py \
 --do_eval \
 --num_thread_reader=4 \
 --epochs=50 \

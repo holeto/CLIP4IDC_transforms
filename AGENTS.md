@@ -1,0 +1,101 @@
+
+## What this is
+
+CLIP4IDC ([paper](https://arxiv.org/abs/2206.00629)): image difference captioning built on CLIP ViT-B/32, derived from CLIP4Clip/UniVL. It takes a (before, after) image pair and either retrieves matching text (stage 1) or generates a change caption (stage 2). Datasets: CLEVR-Change (`clevr`) and Spot-the-Diff (`spot`). Code and variable names still say "video"/"frame" (a pair is treated as a 2-frame video); that is known and expected.
+
+There is no build system, linter, or general test suite. Everything is run as a script on GPU(s) with NCCL. The only tests are the CPU checks of the multi-sample TRANCE handling: `python tests/test_trance_multi_sample.py` (needs torch, no GPU/data/CLIP weight; no pytest on this machine).
+
+## Commands
+
+Both entry points call `torch.distributed.init_process_group(backend="nccl")` at import time, so they must be launched through `python -m torch.distributed.run` (= torchrun; the `torchrun` wrapper on this machine has a dead shebang) (even for one GPU; `python -m torch.distributed.launch` passes `--local-rank`, which the scripts' `--local_rank` argparse flag rejects on torch>=2) and need CUDA. Ready-made launch lines are in `scripts/*.sh`; the placeholders `your_data/...` and `your_jdk/` must be edited first.
+
+```sh
+# Stage 1 - adaptation (contrastive retrieval); produces ckpts/pretrained-style weights
+python -m torch.distributed.run --nproc_per_node=2 main_task_retrieval.py --do_train --datatype clevr|spot ... (scripts/retrieve_{clevr,spot}.sh)
+
+# Stage 2 - captioning finetune, initialised from stage-1 weights via --init_model
+python -m torch.distributed.run --nproc_per_node=1 main_task_caption.py --do_train --datatype clevr --init_model ckpts/pretrained/pytorch_model.bin.clevr ... (scripts/caption_clevr.sh)
+
+# Evaluate only (the closest thing to a "single test"): --do_eval with a trained checkpoint
+scripts/eval_caption_clevr.sh   # --do_eval --init_model ckpts/trained/pytorch_model.bin.clevr
+```
+
+- `--features_path` is the dataset root for CLEVR but `${DATA_PATH}/images` for Spot-the-Diff; `--data_path` is the dataset root for both.
+- Reproduction flags are fixed across scripts: `--max_words 32 --lr 1e-4 --coef_lr 1e-3 --freeze_layer_num 0 --linear_patch 2d --pretrained_clip_name ViT-B/32`. The README says not to change `--num_thread_reader=4` when reproducing results.
+- `CLIP.get_config` looks for the CLIP weight at `modules/ViT-B-32.pt` (see README for the `wget`) and otherwise tries to download it.
+- Caption evaluation uses `pycocoevalcap`, which needs **Java** (METEOR / PTB tokenizer) on `PATH` (hence `JAVA_HOME` in the caption scripts), and ground-truth files in `gt/<datatype>_total_change_captions_reformat.json` (`--gt_dir`).
+- `visualize.py` loads a trained model and renders attention maps (uses `skimage`, `matplotlib`).
+- `preprocess/reformat_dataset.py` builds the Spot-the-Diff `reformat_*.json` files; `preprocess/eval_utils.py` builds the COCO-format GT files in `gt/`.
+
+## Architecture
+
+**Two-stage training, same model class.** `modules/modeling.py:CLIP4IDC` switches behaviour on `task_config.task_type`: `"retrieval"` sets `_stage_one` (symmetric InfoNCE loss `CrossEn` over text vs. pair embeddings, with `allgather` across GPUs), `"caption"` sets `_stage_two` and additionally builds a `DecoderModel` (`modules/module_decoder.py`) whose token/position embeddings are tied to CLIP's text embeddings; loss is token cross-entropy (`ignore_index=0`). Stage 2 is meant to start from stage-1 weights (`--init_model`). `main_task_retrieval.py` asserts `task_type == "retrieval"` and `main_task_caption.py` asserts `"caption"` (the default in each file).
+
+**Image-pair encoder (the core idea, `modules/module_clip.py:VisualTransformer`).** The two images are stacked into the batch dimension (`b*2`). The first `intra_num_hidden_layers` (default 9) CLIP blocks run per image independently; then the two token sequences are concatenated, given `bef_embedding`/`aft_embedding` and `joint_positional_embedding`, normalised with `ln_mid`, and the remaining blocks attend across both images. In captioning, the decoder cross-attends to this full hidden sequence (`visual_output`), not just the pooled embedding. `linear_patch=3d` swaps `conv1` for a `conv2` Conv3d patch embed (initialised from `conv1` in `CLIP4IDC.from_pretrained`). `visualize=True` on the forward returns per-layer attention weights.
+
+**Data flow.** `dataloaders/data_dataloaders.py` has `DATALOADER_DICT[datatype][split]` and picks the retrieval or caption dataset class from `args.task_type`. `rawimage_util.py` is the shared image transform (resize to 224x224 with no crop, CLIP mean/std normalise). The CLEVR caption loader additionally yields a third "no-change" image (`nc_image`) with its own captions; at eval time, CLEVR decodes both (before, after) and (before, nc) pairs and the no-change hypotheses are tagged with an `_n` suffix on `image_id`. Batches therefore have different tuple layouts for `clevr` vs `spot`; any change to a loader must be mirrored in the unpacking in `train_epoch`/`eval_epoch` of `main_task_caption.py`.
+
+**Caption training loop** (`main_task_caption.py`): train one epoch, save `pytorch_model.bin.<epoch>` to `--output_dir`, run `eval_epoch` (greedy decode, writes `hyp_ep_<epoch>.json`, scores with a local `EvalCap` subclass), track best CIDEr, early-stop after >10 non-improving epochs. Eval and checkpointing run only on rank 0. `beam_decode` and `modules/beam.py` exist but `eval_epoch` uses `greedy_decode`.
+
+**Checkpoints and resuming (both stages, since 2026-11-02):** every epoch, rank 0 saves the weights to `pytorch_model.bin.<epoch>`, evaluates, then writes the training state to `pytorch_opt.bin.<epoch>` (optimizer incl. the schedule's step count, global step, best score and file, CIDEr early-stop counter and "stopped" flag, Python/NumPy/torch/CUDA RNG states); both via `util.atomic_save` (temp file + rename), all epochs kept (~0.35-0.5 GB each). `--resume_model <state file>` or `--resume_model latest` (newest complete epoch in `--output_dir`, fresh start if none) loads that epoch's weights in place of `--init_model` and continues; it refuses a run with a different total step count (epochs, batch size, data), a finished or early-stopped run trains nothing. Checked on one GPU: resuming after epoch 0 gives the same losses and metrics as the uninterrupted run, for both stages and both targets. With several GPUs only rank 0's RNG state is saved, so continuation is not bit-exact there.
+
+**Seeding quirk:** `main_task_caption.py`'s `set_seed_logger` only seeds/sets deterministic cudnn for `clevr` and `trance` (not `spot`); `main_task_retrieval.py` always does (`--seed`, default 42). For CLEVR, training captions are sampled with `random.choice` in `dataloader_clevr_caption.py` (README documents a fixed-caption variant to remove this source of variance).
+
+**Freezing logic:** `--freeze_layer_num` freezes CLIP params below that block index, except the always-trainable list (`ln_final`, `text_projection`, `logit_scale`, `visual.ln_post/proj/bef_embedding/aft_embedding/joint_positional_embedding/ln_mid`). The `elif` freeze condition `args.linear_patch == "3d" and name.find("conv2.")` is truthy for any name that isn't at position 0 (`find` returns -1), so it effectively skips freezing whenever `linear_patch == "3d"`.
+
+## TRANCE dataset (`--datatype trance`)
+
+Status: the pipeline (stage 1 retrieval, stage 2 captioning, `--do_eval`) runs end to end on `trance_regen_100` (1 sample per transformation) and on the tiny multi-sample example `trance_gen_test/g4/standard` (3 transformations x 4 members, converted). This is a **crash check only**: the target is a text stand-in for a JSON transformation, nothing here says anything about model quality.
+
+Sibling repos: `../TRANCE_dataset/` (data), `../TVR_multi_sample/` (generator; `notes/` explain transformations and multi-sample design).
+
+### Design so far
+
+- **Data layout** (the "converted" one, e.g. `trance_regen_100/`): `data.jsonl` + `split.json` + `image/`; run with `--data_path <dir> --features_path <dir>/image`. A row has `idx`, `trans_id`, `member`, `states` (initial + final, each with per-camera image file names) and `transformations` (steps `{obj_idx, attr, val, options, obj_key[, type]}`). Images are 320x240 RGBA with opaque alpha, so the RGB conversion in `rawimage_util` loses nothing.
+- **New datatype with the Spot batch layout.** There is no "no-change" image, so the CLEVR layout (13-tuple, third image) does not fit. `main_task_caption.py` already sends every non-`clevr` datatype through the Spot unpacking, so `main_task_*.py` have no TRANCE branch. Registered in `dataloaders/data_dataloaders.py` as `DATALOADER_DICT["trance"]`; classes in `dataloaders/dataloader_trance_{caption,retrieval}.py`, shared reading code in `dataloaders/trance_util.py`.
+- **Image pair** = `states[0]` `Camera_Center` (before) and `states[-1]` `Camera_Center` (after); the other two final cameras are ignored (`final_camera` kwarg to change that). Only the first and last state are read, so sets with rendered intermediate stages work unchanged.
+- **Text target is a placeholder.** `trance_util.transformation_to_text` is the single place where the JSON becomes text: `"<obj_key, _ -> space> <attr> <val>"` steps joined by `"; "`, e.g. `small yellow glass cube color cyan; small yellow glass cube position behind 2 inner` (position steps keep the move `type`; `options` and `obj_idx` are dropped). Raw `json.dumps` of the steps is 67-161 CLIP tokens on average against a hard text context of 77 (the decoder shares CLIP's position embeddings), so it would be truncated. When the target becomes structured, replace that one function; the loaders and the GT script both go through it.
+- **Token budget:** use `--max_words 64`. The f-string form peaks at 41 tokens (+CLS/SEP); the default 32 truncates ~18% of samples.
+- **Scoring:** `python preprocess/trance_gt.py <data_dir> [out_dir]` writes `trance_total_change_captions_reformat.json` (COCO format, `image_id` = `str(idx)`, text from the same function as the training targets), then pass `--gt_dir <that dir>` to `main_task_caption.py` (needs Java, see above). BLEU/METEOR/CIDEr on these strings are only a plumbing check.
+- **Launch lines:** `scripts/{retrieve,caption}_trance.sh` (batch size 8 for an 8 GB GPU, `DATA_PATH=../TRANCE_dataset/trance_regen_100`). Stage 2 is initialised from the stage-1 checkpoint via `--init_model`.
+- **Not changed, affects training quality (not crashes):** `main_task_caption.py` keeps `token_embedding` frozen for every datatype except `spot` (l.~649), and `main_task_caption.py`'s `set_seed_logger` seeds only for `clevr` and (since 2026-11-02, `--seed`, default 42) `trance` (stage 1, `main_task_retrieval.py`, always seeds with `--seed`, default 42, and sets deterministic cuDNN). Decide whether TRANCE should follow Spot / be seeded before real runs.
+
+### Multi-sample sets (several (before, after) pairs per transformation)
+
+Built by `../TVR_multi_sample/scripts/convert_generated.py` (needs `jsonlines`, which training does not) into the same layout, but with these differences, all handled by the loader:
+
+- `idx` is a unique running id per **sample**; `trans_id` is shared by all members of a transformation; `member` numbers them. `idx == trans_id` only when there is one member per transformation. The loader keys everything on `idx` (sample id, COCO `image_id`), never on `trans_id`.
+- `split.json` has `n_samples` != `n_transformations` and splits whole transformations. The loader cuts the file by cumulative `n_samples` (asserted to sum to the row count).
+- Asserted in `load_trance_split`: no `trans_id` spans two splits, no initial scene (stage-0 objects with positions) spans two splits, every member of a `trans_id` renders to the same text, `idx` is unique. Whether a transformation key may span splits depends on the setup (below).
+- The text uses only member-invariant fields (`obj_key`, `attr`, `val`, `type`); per-member `obj_idx` and `options` differ and are not used. `dataset.trans_ids` exposes the group of every sample for group-aware code.
+- **`trans_id` is the generator's integer group index, not the content.** The same transformation drawn twice gets two `trans_id`s. `trance_util.transformation_key` identifies the content (it must follow the target, so it is the text for now; the generator's canonical step order since 2026-10-26 makes equal transformations give equal keys, older sets may hold one transformation in two step orders). `load_trance_split` numbers the distinct keys of the whole file as `target_id` (same in every split). The converter splits by `trans_id`, so a repeated transformation can land in two splits. Repeats are likely in large sets (one-step transformations are a small space: `trance_center_1step`, 33,125 groups, has 10,685 distinct targets, and 89% of its val/test transformations also occur in train).
+- **Evaluation setup (`--test_transformation_generalization`, both main scripts):** unset (default) = *scene generalization*: a transformation may occur in several splits (on different scenes), and loading val/test logs `N% of transformations in the <split> set (k of K) are contained in the train set`. Set = *transformation generalization*: a key in two splits fails with "spans splits" (the converter must then split by transformation). Nothing in the code depends on the choice: `target_id` is numbered over the whole file, the loss masks repeats only inside a train batch, and the group metric works within the test split.
+
+**Stage 1 / retrieval handling (implemented 2026-10-26, checks in `tests/test_trance_multi_sample.py`):**
+
+- The retrieval dataset returns `target_id` as a 7th item and exposes `dataset.target_ids`; `main_task_retrieval.py` takes `batch[:6]` plus an optional `batch[6]` and passes `target_ids=` to the model (CLEVR/Spot pass none and are unchanged). The caption loader is unchanged (Spot layout).
+- **Masked contrastive loss:** `CLIP4IDC._same_target_mask` (ids allgathered like the embeddings) marks off-diagonal pairs with the same `target_id`; `CrossEn(sim, mask)` sets them to `-inf` before the log-softmax. The diagonal is never masked, so every row stays finite; a batch of one transformation gives a loss of exactly 0 (still in the graph). Checked: finite gradients in fp32/fp16 on CPU and CUDA, equal to the loss with those entries removed. Loss is averaged over all rows (a row loses all negatives only if the whole batch is one transformation, so averaging over "rows with negatives" would change nothing).
+- **Group retrieval metric** (`metrics.group_retrieval_metrics`, used in `eval_epoch` when the dataset has `target_ids`): a K x G matrix, K distinct transformations (texts) by G generation groups (`trans_id`), a group scored by the mean similarity over its members. **Batch-to-Text R@1 is the main metric and selects the best checkpoint on TRANCE**; Text-to-Batch counts the best group of a transformation (its other groups are not wrong). Ranks count strictly higher wrong candidates, so ties add no entries. With one member per group it equals the per-sample metric (checked on `trance_regen_100`: B2T = V2T, T2B = T2V). The per-sample metrics are still logged above it and stay capped (about 1/N members at R@1). A test split with one transformation (g4) gives a trivial B2T of 100.
+
+**Caveats:**
+
+1. **Per-sample retrieval metrics are capped and have a tie artefact.** For text `i` the other members of its group are equally correct but count as wrong (ceiling R@1 about 1/N, R@k about k/N for k < N), and `metrics.compute_metrics` (pair-to-text) returns every position tied with the diagonal, so identical texts add several entries per row (confirmed: 8 pairs with 2 texts x 4 identical copies give 32 entries). Use the group metric above; `compute_metrics` is left as is for CLEVR/Spot reproducibility.
+2. **Captioning eval repeats the same reference.** Every member is a separate `image_id` with the same single reference, so the test set contains N copies of each target; scores are fine but the effective test size is `n_transformations`, not `n_samples`.
+3. **Tiny splits and `drop_last`.** The train loader drops the last incomplete batch; `dataloader_trance_train` raises a `ValueError` when the train split is smaller than one batch per process instead of running zero steps (g4: train has 4 samples, so use `--batch_size 4`). The g4 train split is one transformation, so its stage-1 loss is always 0.
+4. **Dummy/debug data:** the smoke tests in the scratchpad used a dummy CLEVR set (marked `DUMMY`, random shapes), the converted `g4` copy, and a `DUMMY_trance_dup` set built from g4 rows (one transformation repeated under a second `trans_id`, two groups with a fake `val` that does not match the images); none is a result.
+
+### Grammar target (`--target grammar`, 2026-10-27)
+
+Alternative to the text target: the transformation is a derivation of the TRANCE grammar (`../TVR_multi_sample/grammar/`, imported only by `modules/trance_grammar.py`, root overridable with `TRANCE_GRAMMAR_ROOT`) and a PyTorch port of the Grammar VAE (`modules/module_gvae.py`) replaces CLIP's text tower (`modules/modeling_grammar.py:CLIP4IDCGrammar`). Stage 1 = contrastive (pair embedding vs. GVAE `z_mean`) + GVAE loss; stage 2 decodes the derivation from the pair embedding under `--grammar_mask {init_desc,program,cfg}`, scored by exact match (no Java). Needs data from the generator with the grammar constraints (`TRANCE_dataset/trance_gvae_{s1,g4d}`); older sets fail the semantic masks. Launch lines `scripts/{retrieve,caption}_trance_grammar.sh`, tests `python tests/test_trance_grammar_vae.py`, code map and validation in `notes/grammar_vae_trance.md`.
+
+### Shared latent space and config (2026-11-02)
+
+- `--latent_dim` (default 56, alias `--gvae_latent_dim`) is the space where TRANCE targets and image pairs are compared, the same for both targets: `CLIP4IDC.visual_to_latent` projects the pooled pair embedding for both, and for `--target text` `CLIP4IDC.text_to_latent` projects CLIP's text embedding (the GVAE encodes into it directly). Both are new layers, so they train at `--lr`; pretrained CLIP at `--lr * --coef_lr`. `--latent_dim 0` keeps CLIP's 512-d space for the text target; CLEVR/Spot never get the projections. Stage 2 with the text target decodes from the visual token sequence, so the projections only matter in stage 1.
+- `--config <yaml>` (both main scripts, `util.parse_args_with_config`, needs PyYAML): sections `common`, `adaptation` (retrieval), `finetuning` (caption); the stage overrides `common`, the command line overrides both, unknown keys fail. `configs/default_one_step.yaml` holds the one-step TRANCE defaults (paper settings where the code allows; differences listed in its header).
+
+## Gotchas
+
+- `scripts/caption_spot.sh` (and the Spot-the-Diff "Finetuning" snippet in the README) launches `main_task_retrieval.py`, which asserts `task_type == "retrieval"` and would re-run stage 1, not captioning. Spot finetuning should use `main_task_caption.py --datatype spot`.
+- `git status` shows nearly every file as modified but `git diff --ignore-cr-at-eol` is empty: the working tree has CRLF line endings (WSL on a Windows checkout) against LF in the index. Don't treat those as real changes, and avoid committing blanket line-ending rewrites.
+- The README references `python utils/eval_utils.py` / `gt/eval_utils.py`; the actual script is `preprocess/eval_utils.py`.
+- Checkpoints, datasets, and the CLIP `.pt` weight are not in the repo (`ckpts/` is created by hand per the README).

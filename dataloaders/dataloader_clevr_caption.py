@@ -115,13 +115,13 @@ class CLEVR_DataLoader(Dataset):
     def _get_text(self, image_id, caption):
         k = 1
         choice_image_ids = [image_id]
-        pairs_text = np.zeros((k, self.max_words), dtype=np.long)
-        pairs_mask = np.zeros((k, self.max_words), dtype=np.long)
-        pairs_segment = np.zeros((k, self.max_words), dtype=np.long)
+        pairs_text = np.zeros((k, self.max_words), dtype=np.int64)
+        pairs_mask = np.zeros((k, self.max_words), dtype=np.int64)
+        pairs_segment = np.zeros((k, self.max_words), dtype=np.int64)
 
-        pairs_input_caption_ids = np.zeros((k, self.max_words), dtype=np.long)
-        pairs_output_caption_ids = np.zeros((k, self.max_words), dtype=np.long)
-        pairs_decoder_mask = np.zeros((k, self.max_words), dtype=np.long)
+        pairs_input_caption_ids = np.zeros((k, self.max_words), dtype=np.int64)
+        pairs_output_caption_ids = np.zeros((k, self.max_words), dtype=np.int64)
+        pairs_decoder_mask = np.zeros((k, self.max_words), dtype=np.int64)
 
         for i, image_id in enumerate(choice_image_ids):
             words = []
@@ -177,7 +177,7 @@ class CLEVR_DataLoader(Dataset):
         choice_image_path = [image_path]
         # Pair x L x T x 3 x H x W
         image = np.zeros((len(choice_image_path), 3, self.rawImageExtractor.size,
-                          self.rawImageExtractor.size), dtype=np.float)
+                          self.rawImageExtractor.size), dtype=float)
 
         for i, image_path in enumerate(choice_image_path):
 
@@ -209,7 +209,7 @@ class CLEVR_DataLoader(Dataset):
         aft_image = self._get_rawimage(aft_image_path)
         no_image = self._get_rawimage(no_image_path)
 
-        image_mask = np.ones(2, dtype=np.long)
+        image_mask = np.ones(2, dtype=np.int64)
         return pairs_text, pairs_mask, pairs_segment, bef_image, aft_image, no_image, image_mask, \
                pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
                no_pairs_input_caption_ids, no_pairs_decoder_mask, no_pairs_output_caption_ids, image_idx_name

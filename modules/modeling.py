@@ -189,7 +189,8 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
         convert_weights(self.clip)
         # <=== End of CLIP Encoders
 
-        if self._stage_one is False and self._stage_two is True:
+        # the grammar target (modeling_grammar.py) brings its own decoder
+        if self._stage_one is False and self._stage_two is True and getattr(task_config, "target", "text") != "grammar":
             decoder_config = update_attr("decoder_config", decoder_config, "num_decoder_layers",
                                          self.task_config, "decoder_num_hidden_layers")
             self.decoder = DecoderModel(decoder_config, bert_word_embeddings_weight, bert_position_embeddings_weight)
@@ -199,8 +200,23 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
 
         self.apply(self.init_weights)
 
+        # TRANCE compares targets and image pairs in a shared latent space of
+        # --latent_dim, the same for the text and the grammar target, so that
+        # both are comparable. The pair embedding is projected for both; the
+        # text embedding for the text target (the grammar's GVAE encodes into
+        # it directly). New layers, so they train at --lr, not CLIP's rate.
+        # CLEVR and Spot keep CLIP's joint space, as in the paper.
+        self.latent_dim = 0
+        if getattr(task_config, "datatype", None) == "trance":
+            self.latent_dim = getattr(task_config, "latent_dim", 0)
+        if self.latent_dim > 0:
+            width = self.clip.text_projection.shape[1]
+            self.visual_to_latent = nn.Linear(width, self.latent_dim)
+            if getattr(task_config, "target", "text") == "text":
+                self.text_to_latent = nn.Linear(width, self.latent_dim)
+
     def forward(self, input_ids, token_type_ids, attention_mask, bef_image, aft_image, image_mask=None,
-                input_caption_ids=None, decoder_mask=None, output_caption_ids=None):
+                input_caption_ids=None, decoder_mask=None, output_caption_ids=None, target_ids=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
         attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
@@ -223,8 +239,12 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
             if self._stage_one is True and self._stage_two is False:
                 sim_matrix, *_tmp = self.get_similarity_logits(sequence_emb, visual_emb, attention_mask, image_mask,
                                                         shaped=True)
-                sim_loss1 = self.loss_fct(sim_matrix)
-                sim_loss2 = self.loss_fct(sim_matrix.T)
+                negative_mask = None
+                if target_ids is not None:
+                    negative_mask = self._same_target_mask(target_ids)
+                # the mask is symmetric, so it also fits the transposed matrix
+                sim_loss1 = self.loss_fct(sim_matrix, negative_mask)
+                sim_loss2 = self.loss_fct(sim_matrix.T, negative_mask)
                 sim_loss = (sim_loss1 + sim_loss2) / 2
                 loss += sim_loss
 
@@ -254,6 +274,8 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
         sequence_hidden = sequence_hidden.float()
         sequence_output = sequence_output.float()
         sequence_hidden = sequence_hidden.view(bs_pair, -1, sequence_hidden.size(-1))
+        if hasattr(self, "text_to_latent"):
+            sequence_hidden = self.text_to_latent(sequence_hidden)
 
         return sequence_hidden, sequence_output
 
@@ -270,6 +292,8 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
         visual_hidden = visual_hidden.float()
         visual_output = visual_output.float()
         visual_hidden = visual_hidden.view(bs_pair, -1, visual_hidden.size(-1))
+        if self.latent_dim > 0:
+            visual_hidden = self.visual_to_latent(visual_hidden)
 
         return visual_hidden, visual_output
 
@@ -356,6 +380,15 @@ class CLIP4IDC(CLIP4IDCPreTrainedModel):
         logit_scale = self.clip.logit_scale.exp()
         retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
         return retrieve_logits
+
+    def _same_target_mask(self, target_ids):
+        """Off-diagonal entries of the similarity matrix whose samples share a target id (not negatives)."""
+        target_ids = target_ids.view(-1)
+        if self.training:
+            # same order as the embeddings gathered in _loose_similarity
+            target_ids = allgather(target_ids, self.task_config)
+        same = target_ids.unsqueeze(0) == target_ids.unsqueeze(1)
+        return same & ~torch.eye(same.shape[0], dtype=torch.bool, device=same.device)
 
     def get_similarity_logits(self, sequence_output, visual_output, attention_mask, visual_mask, shaped=False):
         if shaped is False:

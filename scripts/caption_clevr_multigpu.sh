@@ -4,7 +4,7 @@ export JAVA_HOME="your_java"
 export PATH=$JAVA_HOME/bin:$PATH
 
 DATA_PATH=your_data/clevr_change/data
-python -m torch.distributed.launch --nproc_per_node=2 --master_port=5558 main_task_caption.py \
+python -m torch.distributed.run --nproc_per_node=2 --master_port=5558 main_task_caption.py \
 --do_train \
 --num_thread_reader=4 \
 --epochs=50 \

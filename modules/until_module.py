@@ -183,7 +183,11 @@ class CrossEn(nn.Module):
     def __init__(self,):
         super(CrossEn, self).__init__()
 
-    def forward(self, sim_matrix):
+    def forward(self, sim_matrix, mask=None):
+        # mask: entries that are not negatives (e.g. another sample with the same text); the diagonal must
+        # stay unmasked, so every row keeps a finite term and a fully masked row gives a loss of exactly 0
+        if mask is not None:
+            sim_matrix = sim_matrix.masked_fill(mask, float("-inf"))
         logpt = F.log_softmax(sim_matrix, dim=-1)
         logpt = torch.diag(logpt)
         nce_loss = -logpt

@@ -83,7 +83,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
 def load_image(path):
     image = Image.open(path)
-    image = image.resize((224, 224), Image.ANTIALIAS)
+    image = image.resize((224, 224), Image.LANCZOS)
     image = np.array(image)
     return image
 

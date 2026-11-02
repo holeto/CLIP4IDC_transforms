@@ -1,7 +1,7 @@
 #!/bin/bash
 
 DATA_PATH=your_data/spot-the-diff/download
-python -m torch.distributed.launch --nproc_per_node=2 --master_port=6666 main_task_retrieval.py \
+python -m torch.distributed.run --nproc_per_node=2 --master_port=6666 main_task_retrieval.py \
 --do_train \
 --num_thread_reader=4 \
 --epochs=20 \

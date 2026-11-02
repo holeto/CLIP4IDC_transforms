@@ -7,15 +7,18 @@ import torch
 import numpy as np
 import random
 import os
-from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
+from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim, group_retrieval_metrics
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling import CLIP4IDC
+from modules.grammar_args import add_grammar_args
+from dataloaders.trance_util import add_trance_args
 from modules.optimization import BertAdam
 
-from util import parallel_apply, get_logger
+from util import atomic_save, resolve_resume, restore_training_state, rng_state
+from util import parse_args_with_config, parallel_apply, get_logger, log_loss_terms
 from dataloaders.data_dataloaders import DATALOADER_DICT
 
 torch.distributed.init_process_group(backend="nccl")
@@ -51,7 +54,9 @@ def get_args(description='CLIP4IDC on Retrieval Task'):
     parser.add_argument("--cross_model", default="cross-base", type=str, required=False, help="Cross module")
     parser.add_argument("--decoder_model", default="decoder-base", type=str, required=False, help="Decoder module")
     parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
-    parser.add_argument("--resume_model", default=None, type=str, required=False, help="Resume train model.")
+    parser.add_argument("--resume_model", default=None, type=str, required=False,
+                        help="Resume training from a pytorch_opt.bin.<epoch> state file, or 'latest' for the "
+                             "newest complete epoch in --output_dir (starts fresh if there is none).")
     parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
                         help="Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% of training.")
@@ -88,8 +93,12 @@ def get_args(description='CLIP4IDC on Retrieval Task'):
                         help="linear projection of flattened patches.")
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
+    add_grammar_args(parser)
+    add_trance_args(parser)
+    parser.add_argument("--config", default=None, type=str,
+                        help="YAML file with defaults (sections common, adaptation, finetuning; see util.py)")
 
-    args = parser.parse_args()
+    args = parse_args_with_config(parser, "adaptation")
 
     # Check paramenters
     if args.gradient_accumulation_steps < 1:
@@ -147,6 +156,13 @@ def init_device(args, local_rank):
 
     return device, n_gpu
 
+def model_class(args):
+    if args.target == "grammar":
+        # imported here, so that the text target does not need the TRANCE grammar
+        from modules.modeling_grammar import CLIP4IDCGrammar
+        return CLIP4IDCGrammar
+    return CLIP4IDC
+
 def init_model(args, device, n_gpu, local_rank):
 
     if args.init_model:
@@ -156,7 +172,8 @@ def init_model(args, device, n_gpu, local_rank):
 
     # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
-    model = CLIP4IDC.from_pretrained(args.cross_model, args.decoder_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
+    model = model_class(args).from_pretrained(args.cross_model, args.decoder_model, cache_dir=cache_dir,
+                                              state_dict=model_state_dict, task_config=args)
 
     model.to(device)
 
@@ -179,8 +196,10 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
                            and "clip.visual.joint_positional_embedding" not in n
                            and "clip.visual.bef_embedding" not in n
                            and "clip.visual.aft_embedding" not in n]
+    # parameters outside CLIP (e.g. the GVAE of the grammar target) train at the full lr
     decay_noclip_param_tp = [(n, p) for n, p in decay_param_tp
-                             if "clip.visual.ln_mid" in n
+                             if "clip." not in n
+                             or "clip.visual.ln_mid" in n
                              or "clip.visual.joint_positional_embedding" in n
                              or "clip.visual.bef_embedding" in n
                              or "clip.visual.aft_embedding" in n]
@@ -192,7 +211,8 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
                               and "clip.visual.bef_embedding" not in n
                               and "clip.visual.aft_embedding" not in n]
     no_decay_noclip_param_tp = [(n, p) for n, p in no_decay_param_tp
-                                if "clip.visual.ln_mid" in n
+                                if "clip." not in n
+                                or "clip.visual.ln_mid" in n
                                 or "clip.visual.joint_positional_embedding" in n
                                 or "clip.visual.bef_embedding" in n
                                 or "clip.visual.aft_embedding" in n]
@@ -221,16 +241,8 @@ def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
     model_to_save = model.module if hasattr(model, 'module') else model
     output_model_file = os.path.join(
         args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
-    optimizer_state_file = os.path.join(
-        args.output_dir, "pytorch_opt.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
-    torch.save(model_to_save.state_dict(), output_model_file)
-    # torch.save({
-    #         'epoch': epoch,
-    #         'optimizer_state_dict': optimizer.state_dict(),
-    #         'loss': tr_loss,
-    #         }, optimizer_state_file)
+    atomic_save(model_to_save.state_dict(), output_model_file)
     logger.info("Model saved to %s", output_model_file)
-    logger.info("Optimizer saved to %s", optimizer_state_file)
     return output_model_file
 
 def load_model(epoch, args, n_gpu, device, model_file=None):
@@ -263,8 +275,11 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             # multi-gpu does scattering it-self
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
-        input_ids, input_mask, segment_ids, bef_image, aft_image, image_mask = batch
-        loss = model(input_ids, segment_ids, input_mask, bef_image, aft_image, image_mask)
+        # with --target grammar the text slots hold rules, rule validity and rule masks (dataloader_trance_grammar.py)
+        input_ids, input_mask, segment_ids, bef_image, aft_image, image_mask = batch[:6]
+        # TRANCE adds the target id of every sample: samples with the same text are not negatives
+        target_ids = batch[6] if len(batch) > 6 else None
+        loss = model(input_ids, segment_ids, input_mask, bef_image, aft_image, image_mask, target_ids=target_ids)
 
         if n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu.
@@ -297,6 +312,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                log_loss_terms(logger, model)
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
@@ -358,7 +374,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         # ----------------------------
         for bid, batch in enumerate(test_dataloader):
             batch = tuple(t.to(device) for t in batch)
-            input_ids, input_mask, segment_ids, bef_image, aft_image, image_mask = batch
+            input_ids, input_mask, segment_ids, bef_image, aft_image, image_mask = batch[:6]
             image_pair = torch.cat([bef_image, aft_image], 1)
 
             if multi_sentence_:
@@ -422,6 +438,13 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
             sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)
             sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
 
+    # TRANCE: score generation groups (trans_id) against distinct transformations; one text per pair,
+    # so the matrix is N x N in dataset order here
+    group_metrics = None
+    if hasattr(test_dataloader.dataset, 'target_ids'):
+        group_metrics = group_retrieval_metrics(sim_matrix, test_dataloader.dataset.target_ids,
+                                                test_dataloader.dataset.trans_ids)
+
     if multi_sentence_:
         logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
@@ -445,6 +468,17 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
 
     R1 = tv_metrics['R1']
+    if group_metrics is not None:
+        b2t_metrics, t2b_metrics = group_metrics
+        logger.info("Per-sample metrics above are capped by the members per transformation; group-level:")
+        logger.info("Batch-to-Text ({} groups, mean similarity over members):".format(b2t_metrics['n']))
+        logger.info('\t>>>  B2T$R@1: {:.1f} - B2T$R@5: {:.1f} - B2T$R@10: {:.1f} - B2T$Median R: {:.1f} - B2T$Mean R: {:.1f}'.
+                    format(b2t_metrics['R1'], b2t_metrics['R5'], b2t_metrics['R10'], b2t_metrics['MR'], b2t_metrics['MeanR']))
+        logger.info("Text-to-Batch ({} transformations):".format(t2b_metrics['n']))
+        logger.info('\t>>>  T2B$R@1: {:.1f} - T2B$R@5: {:.1f} - T2B$R@10: {:.1f} - T2B$Median R: {:.1f} - T2B$Mean R: {:.1f}'.
+                    format(t2b_metrics['R1'], t2b_metrics['R5'], t2b_metrics['R10'], t2b_metrics['MR'], t2b_metrics['MeanR']))
+        # model selection on TRANCE
+        R1 = b2t_metrics['R1']
     return R1
 
 def main():
@@ -454,6 +488,8 @@ def main():
     device, n_gpu = init_device(args, args.local_rank)
 
     tokenizer = ClipTokenizer()
+    # A resumed run starts from the weights of its last complete epoch.
+    resume_state = resolve_resume(args) if args.do_train else None
 
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
@@ -530,17 +566,17 @@ def main():
 
         best_score = 0.00001
         best_output_model_file = "None"
-        ## ##############################################################
-        # resume optimizer state besides loss to continue train
-        ## ##############################################################
-        resumed_epoch = 0
-        if args.resume_model:
-            checkpoint = torch.load(args.resume_model, map_location='cpu')
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            resumed_epoch = checkpoint['epoch']+1
-            resumed_loss = checkpoint['loss']
-        
-        global_step = 0
+        resumed_epoch, global_step = 0, 0
+        if resume_state is not None:
+            resumed_epoch = restore_training_state(resume_state, optimizer, num_train_optimization_steps)
+            global_step = resume_state["global_step"]
+            best_score = resume_state["best_score"]
+            best_output_model_file = resume_state["best_output_model_file"]
+            if args.local_rank == 0:
+                logger.info("Resumed from %s: %s", resume_state["path"],
+                            "all {} epochs done, nothing to train".format(args.epochs) if resumed_epoch >= args.epochs
+                            else "continuing at epoch {}/{}".format(resumed_epoch + 1, args.epochs))
+
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
@@ -559,6 +595,10 @@ def main():
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+                atomic_save({"epoch": epoch, "optimizer_state_dict": optimizer.state_dict(), "loss": tr_loss,
+                             "global_step": global_step, "best_score": best_score,
+                             "best_output_model_file": best_output_model_file, "rng": rng_state()},
+                            os.path.join(args.output_dir, "pytorch_opt.bin.{}".format(epoch)))
 
     elif args.do_eval:
         if args.local_rank == 0:

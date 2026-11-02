@@ -15,10 +15,13 @@ import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling import CLIP4IDC
+from modules.grammar_args import add_grammar_args
+from dataloaders.trance_util import add_trance_args
 from modules.optimization import BertAdam
 from modules.beam import Beam
 
-from util import parallel_apply, get_logger
+from util import atomic_save, resolve_resume, restore_training_state, rng_state
+from util import parse_args_with_config, parallel_apply, get_logger, log_loss_terms
 from dataloaders.data_dataloaders import DATALOADER_DICT
 
 from pycocotools.coco import COCO
@@ -106,7 +109,9 @@ def get_args(description='CLIP4IDC on Captioning Task'):
     parser.add_argument("--cross_model", default="cross-base", type=str, required=False, help="Cross module")
     parser.add_argument("--decoder_model", default="decoder-base", type=str, required=False, help="Decoder module")
     parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
-    parser.add_argument("--resume_model", default=None, type=str, required=False, help="Resume train model.")
+    parser.add_argument("--resume_model", default=None, type=str, required=False,
+                        help="Resume training from a pytorch_opt.bin.<epoch> state file, or 'latest' for the "
+                             "newest complete epoch in --output_dir (starts fresh if there is none).")
     parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
                         help="Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% of training.")
@@ -143,10 +148,14 @@ def get_args(description='CLIP4IDC on Captioning Task'):
                         help="linear projection of flattened patches.")
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
+    add_grammar_args(parser)
+    add_trance_args(parser)
+    parser.add_argument("--config", default=None, type=str,
+                        help="YAML file with defaults (sections common, adaptation, finetuning; see util.py)")
     parser.add_argument("--gt_dir", default="gt", type=str,
                         help="The output directory where the model predictions and checkpoints will be written.")
 
-    args = parser.parse_args()
+    args = parse_args_with_config(parser, "finetuning")
 
     # Check paramenters
     if args.gradient_accumulation_steps < 1:
@@ -161,8 +170,8 @@ def get_args(description='CLIP4IDC on Captioning Task'):
 
 def set_seed_logger(args):
     global logger
-    # predefining random initial seeds
-    if args.datatype == "clevr":
+    # predefining random initial seeds (Spot-the-Diff stays unseeded, as upstream)
+    if args.datatype in ("clevr", "trance"):
         random.seed(args.seed)
         os.environ['PYTHONHASHSEED'] = str(args.seed)
         np.random.seed(args.seed)
@@ -205,6 +214,13 @@ def init_device(args, local_rank):
 
     return device, n_gpu
 
+def model_class(args):
+    if args.target == "grammar":
+        # imported here, so that the text target does not need the TRANCE grammar
+        from modules.modeling_grammar import CLIP4IDCGrammar
+        return CLIP4IDCGrammar
+    return CLIP4IDC
+
 def init_model(args, device, n_gpu, local_rank):
 
     if args.init_model:
@@ -214,7 +230,8 @@ def init_model(args, device, n_gpu, local_rank):
 
     # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
-    model = CLIP4IDC.from_pretrained(args.cross_model, args.decoder_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
+    model = model_class(args).from_pretrained(args.cross_model, args.decoder_model, cache_dir=cache_dir,
+                                              state_dict=model_state_dict, task_config=args)
 
     model.to(device)
 
@@ -270,16 +287,8 @@ def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
     model_to_save = model.module if hasattr(model, 'module') else model
     output_model_file = os.path.join(
         args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
-    optimizer_state_file = os.path.join(
-        args.output_dir, "pytorch_opt.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
-    torch.save(model_to_save.state_dict(), output_model_file)
-    # torch.save({
-    #         'epoch': epoch,
-    #         'optimizer_state_dict': optimizer.state_dict(),
-    #         'loss': tr_loss,
-    #         }, optimizer_state_file)
+    atomic_save(model_to_save.state_dict(), output_model_file)
     logger.info("Model saved to %s", output_model_file)
-    logger.info("Optimizer saved to %s", optimizer_state_file)
     return output_model_file
 
 def load_model(epoch, args, n_gpu, device, model_file=None):
@@ -311,7 +320,11 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         image_name = batch[-1]
         batch = tuple(t.to(device=device, non_blocking=True) for t in batch[:-1])
 
-        if args.datatype == "clevr":
+        if args.target == "grammar":
+            # the text slots hold rules, rule validity and rule masks (dataloader_trance_grammar.py)
+            input_ids, input_mask, segment_ids, bef_image, aft_image, image_mask = batch
+            loss = model(input_ids, segment_ids, input_mask, bef_image, aft_image, image_mask)
+        elif args.datatype == "clevr":
             input_ids, input_mask, segment_ids, bef_image, aft_image, no_image, image_mask, \
             pairs_input_caption_ids, pairs_decoder_mask, pairs_output_caption_ids, \
             no_pairs_input_caption_ids, no_pairs_decoder_mask, no_pairs_output_caption_ids = batch
@@ -362,6 +375,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                log_loss_terms(logger, model)
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
@@ -555,7 +569,47 @@ def greedy_decode(args, model, tokenizer, input_ids, segment_ids, input_mask, vi
 
     return input_caption_ids[:, 1:].tolist()
 
+def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
+    """Decodes every test pair under --grammar_mask and compares it with the true derivation.
+
+    Writes hyp_ep_<epoch>.json and returns the exact-match rate in %, which selects the best checkpoint.
+    """
+    from modules import trance_grammar
+
+    if hasattr(model, 'module'):
+        model = model.module.to(device)
+    else:
+        model = model.to(device)
+    dataset = test_dataloader.dataset
+
+    results = []
+    model.eval()
+    with torch.no_grad():
+        for batch in test_dataloader:
+            sample_ids = batch[-1]
+            _, _, _, bef_image, aft_image, image_mask = (t.to(device, non_blocking=True) for t in batch[:-1])
+            maskers = [trance_grammar.make_masker(args.grammar_mask, dataset.members_of(sample_id), dataset.geometry)
+                       for sample_id in sample_ids]
+            decoded = model.decode_rules(bef_image, aft_image, image_mask, maskers)
+            for sample_id, rules, masker in zip(sample_ids, decoded.tolist(), maskers):
+                program = trance_grammar.program_of_derivation(rules) if masker.done else None
+                # valid in every member's scene, whichever mask decoded it
+                valid = program is not None and trance_grammar.accepts(
+                    dataset.members_of(sample_id), rules, dataset.geometry)
+                results.append({"image_id": sample_id, "rules": rules,
+                                "program": None if program is None else trance_grammar.program_text(program),
+                                "complete": program is not None, "valid": valid,
+                                "exact": rules == dataset.rules_of(sample_id).tolist()})
+
+    json.dump(results, open(os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch), "w"), indent=1)
+    rate = {key: 100.0 * sum(r[key] for r in results) / len(results) for key in ["exact", "valid", "complete"]}
+    logger.info(">>>  Exact match: {:.1f} - Valid in every scene: {:.1f} - Complete: {:.1f} ({} pairs, {} mask)".format(
+        rate["exact"], rate["valid"], rate["complete"], len(results), args.grammar_mask))
+    return rate["exact"]
+
 def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, test_set=None, epoch=None):
+    if args.target == "grammar":
+        return eval_epoch_grammar(args, model, test_dataloader, device, epoch=epoch)
     if hasattr(model, 'module'):
         model = model.module.to(device)
     else:
@@ -633,6 +687,8 @@ def main():
     device, n_gpu = init_device(args, args.local_rank)
 
     tokenizer = ClipTokenizer()
+    # A resumed run starts from the weights of its last complete epoch.
+    resume_state = resolve_resume(args) if args.do_train else None
 
     assert args.task_type == "caption"
     model = init_model(args, device, n_gpu, args.local_rank)
@@ -714,18 +770,22 @@ def main():
 
         best_score = 0.00001
         best_output_model_file = "None"
-        ## ##############################################################
-        # resume optimizer state besides loss to continue train
-        ## ##############################################################
-        resumed_epoch = 0
-        if args.resume_model:
-            checkpoint = torch.load(args.resume_model, map_location='cpu')
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            resumed_epoch = checkpoint['epoch']+1
-            resumed_loss = checkpoint['loss']
-        
-        global_step = 0
-        early_stop = 0
+        resumed_epoch, global_step, early_stop = 0, 0, 0
+        if resume_state is not None:
+            resumed_epoch = restore_training_state(resume_state, optimizer, num_train_optimization_steps)
+            global_step = resume_state["global_step"]
+            best_score = resume_state["best_score"]
+            best_output_model_file = resume_state["best_output_model_file"]
+            early_stop = resume_state["early_stop"]
+            # A run that stopped early stays stopped.
+            if resume_state["stopped"]:
+                resumed_epoch = args.epochs
+            if args.local_rank == 0:
+                logger.info("Resumed from %s: %s", resume_state["path"],
+                            "stopped early, nothing to train" if resume_state["stopped"]
+                            else "all {} epochs done, nothing to train".format(args.epochs) if resumed_epoch >= args.epochs
+                            else "continuing at epoch {}/{}".format(resumed_epoch + 1, args.epochs))
+
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
@@ -745,7 +805,13 @@ def main():
                     best_score = CIDEr
                     best_output_model_file = output_model_file
                     early_stop = 0
-                logger.info("The best model is: {}, the CIDEr is: {:.4f}".format(best_output_model_file, best_score))
+                logger.info("The best model is: {}, the {} is: {:.4f}".format(
+                    best_output_model_file, "exact match" if args.target == "grammar" else "CIDEr", best_score))
+                atomic_save({"epoch": epoch, "optimizer_state_dict": optimizer.state_dict(), "loss": tr_loss,
+                             "global_step": global_step, "best_score": best_score,
+                             "best_output_model_file": best_output_model_file, "early_stop": early_stop,
+                             "stopped": early_stop > 10, "rng": rng_state()},
+                            os.path.join(args.output_dir, "pytorch_opt.bin.{}".format(epoch)))
                 if early_stop > 10:
                     break
 

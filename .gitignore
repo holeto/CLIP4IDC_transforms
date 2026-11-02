@@ -1,0 +1,16 @@
+#Python
+__pycache__/
+/**/__pycache__/
+
+#coding agents
+.claude/
+
+
+#Virtual environments 
+VENV*/
+.VENV*/
+.venv*/
+venv*/
+
+#Local files
+notes/
