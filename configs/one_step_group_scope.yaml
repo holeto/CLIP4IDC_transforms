@@ -1,0 +1,71 @@
+# The one-step TRANCE settings of the first grammar runs (2026-11-02): configs/default_one_step.yaml
+# as it was then, when every pair's init_desc mask read all four members' scenes. It reproduces
+# runs/one_step/adapt_grammar (job 11937374) and runs/one_step/finetune_grammar (job 11940274),
+# and is kept only for that: the group scope leaves the model a single allowed object in every
+# val/test group (notes/found_failures.md). New runs use configs/default_one_step.yaml (own).
+#
+# Default hyperparameters for one-step TRANCE (trance_center_1step), for both targets
+# (--target text | grammar, given on the command line), scene generalization.
+# Usage: main_task_retrieval.py --config configs/default_one_step.yaml ...   (section adaptation)
+#        main_task_caption.py   --config configs/default_one_step.yaml ...   (section finetuning)
+# The stage section overrides common; command-line flags override both. Data and output
+# paths, --target and --init_model stay on the command line.
+#
+# Follows the CLIP4IDC paper (IDC adaptation / fine-tuning settings) where the released code
+# allows it. Known differences of the released code from the paper, kept as they are: the new
+# pair parameters (bef/aft embedding, joint positional embedding, ln_mid) train at lr, not
+# lr * coef_lr; no separate captioning encoder; the decoder's word embeddings are CLIP's,
+# frozen; optimizer BertAdam (adaptation: weight decay 0.2, warmup-cosine; fine-tuning: 0.01,
+# warmup-linear); adaptation selects its checkpoint on the test split (fine-tuning here: on val).
+
+common:
+  datatype: trance
+  # CLIP ViT-B/32, 224 x 224 images, 2D patch embedding (kernel and stride 32).
+  pretrained_clip_name: ViT-B/32
+  linear_patch: 2d
+  # 9 intra (per image) + 3 inter (joint) layers of the 12 vision layers; 12 text layers.
+  intra_num_hidden_layers: 9
+  visual_num_hidden_layers: 12
+  text_num_hidden_layers: 12
+  freeze_layer_num: 0
+  # Paper: sentence length 32 and greedy decoding <= 32 steps. One-step targets are <= 13
+  # CLIP tokens; multi-step sets need 64.
+  max_words: 32
+  # New layers at lr, pretrained CLIP at lr * coef_lr = 1e-7 (paper), for both targets.
+  lr: 1.0e-4
+  coef_lr: 1.0e-3
+  warmup_proportion: 0.1
+  # Shared latent space of targets and image pairs, the same for text and grammar.
+  latent_dim: 56
+  # Grammar target (Grammar VAE).
+  grammar_mask: init_desc
+  # init_desc reads every member's scene, as these runs did (leaks the answer's object).
+  init_desc_scope: group
+  gvae_hidden: 256
+  gvae_weight: 1.0
+  gvae_kl_weight: 1.0
+  gvae_epsilon_std: 0.01
+  # Scene generalization: transformations may repeat across splits (overlap is logged).
+  test_transformation_generalization: false
+  num_thread_reader: 4
+  batch_size_val: 64
+  seed: 42
+
+adaptation:
+  # Paper: 12 epochs, seeds 42, two V100s; scripts/retrieve_clevr.sh: batch 128 over 2 GPUs
+  # (the same 128 contrastive negatives on one GPU).
+  epochs: 12
+  batch_size: 128
+
+finetuning:
+  # Paper: at most 50 epochs, batch 16, one V100 (early stop after > 10 epochs without a
+  # better CIDEr / exact match). Seeded with `seed` (42) like adaptation.
+  epochs: 50
+  batch_size: 16
+  # Best epoch and early stop by val (upstream: test); test is evaluated and
+  # logged every epoch too (metrics.jsonl). Grammar target: by the share of
+  # pairs whose decode reproduces every member of their group.
+  select_split: val
+  grammar_select_metric: pair_explains_group
+  # Grammar target: the GVAE decoder keeps training in stage 2.
+  freeze_gvae_decoder: false

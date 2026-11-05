@@ -13,6 +13,7 @@ with the no-op rule to MAX_LEN. Three masks restrict the rules per step:
 - program: MaskedDecoder without init_desc, judged by the program alone;
 - cfg: the original GVAE mask, only the rules of the leftmost non-terminal.
 """
+import hashlib
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ grammar = _import_grammar()
 from grammar import cfg  # noqa: E402
 from grammar.decoder import MAX_STEPS, MaskedDecoder  # noqa: E402
 from modules.grammar_args import MASKS  # noqa: E402
+from dataloaders.trance_util import transformation_program  # noqa: E402
 
 K = cfg.K
 NOOP = cfg.NOOP
@@ -53,23 +55,10 @@ MAX_LEN = 1 + 10 * MAX_STEPS
 
 
 def program_of_transformations(transformations):
-    """Program [(descriptor, action)] of the steps of a converted data.jsonl row.
-
-    obj_key spells the stage-0 descriptor as size_color_material_shape, which
-    is the order of R.
-    """
-    program = []
-    for trans in transformations:
-        desc = tuple(trans["obj_key"].split("_"))
-        if trans["attr"] != "position":
-            action = "{}.{}".format(trans["attr"], trans["val"])
-        elif trans["type"] in ("in", "out"):
-            action = "position." + trans["type"]
-        else:
-            direction, n = trans["val"]
-            action = "position.{}.{}".format(direction, n)
-        program.append((desc, action))
-    return program
+    """Program [(descriptor, action)] of the steps of a converted data.jsonl row
+    (dataloaders.trance_util.transformation_program, which also gives the
+    loader's program key)."""
+    return transformation_program(transformations)
 
 
 def derivation_of(program):
@@ -164,3 +153,16 @@ def geometry_of(data_path):
         with open(path) as f:
             return grammar.Geometry(json.load(f))
     return grammar.Geometry()
+
+
+def grammar_version():
+    """Short hash of the grammar package's source, so that caches of its
+    masks are not reused after the grammar changes."""
+    root = os.path.dirname(grammar.__file__)
+    digest = hashlib.md5()
+    for name in sorted(os.listdir(root)):
+        if name.endswith(".py"):
+            digest.update(name.encode())
+            with open(os.path.join(root, name), "rb") as f:
+                digest.update(f.read())
+    return digest.hexdigest()[:12]

@@ -171,15 +171,31 @@ def test_grammar_dataset():
                        "n_transformations": [1, 1, 1]}, f)
 
         for task_type in ("retrieval", "caption"):
-            dataset = TRANCE_Grammar_DataLoader("test", path, os.path.join(path, "image"), None,
-                                                task_type=task_type, image_resolution=16)
-            rules, rule_valid, rule_mask, bef, aft, image_mask, last = dataset[1]
-            assert rules.tolist() == tg.derivation_of(GROUPS[2]["program"])
-            assert rule_valid.sum() == sum(r != tg.NOOP for r in rules)
-            assert rule_mask.shape == (tg.MAX_LEN, tg.K) and rule_mask[np.arange(tg.MAX_LEN), rules].all()
-            assert bef.shape == (1, 3, 16, 16) and image_mask.tolist() == [1, 1]
-            assert last == ("9" if task_type == "caption" else dataset.target_ids[1])
-            assert dataset.members_of("9") == GROUPS[2]["members"]
+            for scope in ("own", "group"):
+                dataset = TRANCE_Grammar_DataLoader("test", path, os.path.join(path, "image"), None,
+                                                    task_type=task_type, image_resolution=16, init_desc_scope=scope)
+                rules, rule_valid, rule_mask, bef, aft, image_mask, last = dataset[1]
+                assert rules.tolist() == tg.derivation_of(GROUPS[2]["program"])
+                assert rule_valid.sum() == sum(r != tg.NOOP for r in rules)
+                assert rule_mask.shape == (tg.MAX_LEN, tg.K) and rule_mask[np.arange(tg.MAX_LEN), rules].all()
+                assert bef.shape == (1, 3, 16, 16) and image_mask.tolist() == [1, 1]
+                assert last == ("9" if task_type == "caption" else dataset.target_ids[1])
+                assert dataset.group_members_of("9") == GROUPS[2]["members"]
+                # Sample "9" is member 1 of the group: own reads only its scene.
+                scenes = [GROUPS[2]["members"][1]] if scope == "own" else GROUPS[2]["members"]
+                assert dataset.members_of("9") == scenes
+                assert np.array_equal(rule_mask, tg.teacher_masks("init_desc", rules.tolist(), scenes, dataset.geometry))
+
+        # The cache: the first load writes it, the second reads the same masks.
+        cache = os.path.join(path, "cache")
+        first = TRANCE_Grammar_DataLoader("test", path, os.path.join(path, "image"), None, image_resolution=16,
+                                          mask_cache_dir=cache, mask_workers=2)
+        assert len(os.listdir(cache)) == 1
+        second = TRANCE_Grammar_DataLoader("test", path, os.path.join(path, "image"), None, image_resolution=16,
+                                           mask_cache_dir=cache)
+        assert sorted(first.masks) == sorted(second.masks)
+        assert all(np.array_equal(first.masks[k], second.masks[k]) for k in first.masks)
+        assert np.array_equal(first[1][2], second[1][2])
 
 
 if __name__ == "__main__":

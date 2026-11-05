@@ -25,6 +25,7 @@ class TRANCE_DataLoader(Dataset):
             image_resolution=224,
             final_camera="Camera_Center",
             test_transformation_generalization=False,
+            key="text",
     ):
         self.data_path = data_path
         self.features_path = features_path
@@ -34,13 +35,17 @@ class TRANCE_DataLoader(Dataset):
         self.subset = subset
         assert self.subset in ["train", "val", "test"]
 
+        # key: what makes two samples the same transformation (trance_util.KEYS); it must follow the
+        # target, so the grammar loader passes "program"
         samples = load_trance_split(self.data_path, self.subset, final_camera=final_camera,
-                                    test_transformation_generalization=test_transformation_generalization)
+                                    test_transformation_generalization=test_transformation_generalization,
+                                    key=key)
         self.samples = samples
         # members of one transformation share a trans_id (every sample is its own group when there is one member)
         self.trans_ids = [sample["trans_id"] for sample in samples]
-        # samples with the same target_id have the same text, also across groups; the contrastive loss
-        # does not use them as negatives of each other, and eval scores groups against distinct texts
+        # samples with the same target_id have the same target (by key), also across groups; the
+        # contrastive loss does not use them as negatives of each other, and eval scores groups against
+        # distinct targets
         self.target_ids = [sample["target_id"] for sample in samples]
 
         self.sample_len = 0

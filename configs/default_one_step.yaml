@@ -10,7 +10,7 @@
 # pair parameters (bef/aft embedding, joint positional embedding, ln_mid) train at lr, not
 # lr * coef_lr; no separate captioning encoder; the decoder's word embeddings are CLIP's,
 # frozen; optimizer BertAdam (adaptation: weight decay 0.2, warmup-cosine; fine-tuning: 0.01,
-# warmup-linear); checkpoint selection on the test split.
+# warmup-linear); adaptation selects its checkpoint on the test split (fine-tuning here: on val).
 
 common:
   datatype: trance
@@ -33,6 +33,9 @@ common:
   latent_dim: 56
   # Grammar target (Grammar VAE).
   grammar_mask: init_desc
+  # init_desc reads only the pair's own initial scene; group (every member's scene)
+  # leaks the answer's object, see configs/one_step_group_scope.yaml.
+  init_desc_scope: own
   gvae_hidden: 256
   gvae_weight: 1.0
   gvae_kl_weight: 1.0
@@ -54,3 +57,10 @@ finetuning:
   # better CIDEr / exact match). Seeded with `seed` (42) like adaptation.
   epochs: 50
   batch_size: 16
+  # Best epoch and early stop by val (upstream: test); test is evaluated and
+  # logged every epoch too (metrics.jsonl). Grammar target: by the share of
+  # pairs whose decode reproduces every member of their group.
+  select_split: val
+  grammar_select_metric: pair_explains_group
+  # Grammar target: the GVAE decoder keeps training in stage 2.
+  freeze_gvae_decoder: false

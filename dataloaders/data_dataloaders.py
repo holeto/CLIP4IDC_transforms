@@ -114,7 +114,10 @@ def _trance_dataset(args, tokenizer, subset):
     if getattr(args, "target", "text") == "grammar":
         # imported here, so that the other datasets do not need the TRANCE grammar
         from dataloaders.dataloader_trance_grammar import TRANCE_Grammar_DataLoader
-        return TRANCE_Grammar_DataLoader(task_type=args.task_type, grammar_mask=args.grammar_mask, **kwargs)
+        return TRANCE_Grammar_DataLoader(task_type=args.task_type, grammar_mask=args.grammar_mask,
+                                         init_desc_scope=getattr(args, "init_desc_scope", "own"),
+                                         mask_cache_dir=getattr(args, "grammar_mask_cache", None),
+                                         mask_workers=getattr(args, "grammar_mask_workers", 0), **kwargs)
     if args.task_type == "retrieval":
         return TRANCE_DataLoader(**kwargs)
     return TRANCE_Caption_DataLoader(**kwargs)
@@ -123,7 +126,8 @@ def _trance_dataset(args, tokenizer, subset):
 def dataloader_trance_train(args, tokenizer):
     trance_dataset = _trance_dataset(args, tokenizer, "train")
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(trance_dataset)
+    # The shuffle follows --seed (the sampler's own default is a fixed 0).
+    train_sampler = torch.utils.data.distributed.DistributedSampler(trance_dataset, seed=args.seed)
     # drop_last=True would silently give an epoch of zero steps
     if len(train_sampler) < args.batch_size // args.n_gpu:
         raise ValueError("train split has {} samples per process, fewer than one batch of {}; lower --batch_size".format(

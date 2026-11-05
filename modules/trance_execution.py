@@ -13,8 +13,9 @@ A program [(descriptor, action)] (trance_grammar.py) is applied step by step:
   'out' also needs a free move of its kind;
 - attribute edits set the value, inner moves shift the cell.
 The grammar's 'in' and 'out' have no direction, so after them the object is
-only known to be in a set of cells (Member's candidate cells after 'in', its
-free invisible destinations after 'out').
+only known to be in a set of cells (Member's cells: the free destinations of
+its moves of that kind, by the generator's move test, where exact contact is
+free; after 'in' a superset of the candidate cells it reserves).
 
 The goal is reproduced if the final state has as many objects as the initial
 one, and every object (matched by its index, which data.jsonl keeps between
@@ -117,6 +118,9 @@ def execution_metrics(programs, samples, geometry):
         group_all: groups (trans_id) where every member's own decode does;
         cross_pairs: ordered pairs (i, j) of members of one group, i == j
             included, where the decode of i reproduces j's goal;
+        pair_explains_group: pairs (samples) whose decode reproduces the
+            goal of every member of their group, the per-pair form of
+            group_every_explains_all;
         group_any_explains_all / group_every_explains_all: groups where at
             least one / every member's decode reproduces the goal of all
             members;
@@ -131,7 +135,7 @@ def execution_metrics(programs, samples, geometry):
     verdicts = {}
     cross = 0
     n_cross = 0
-    groups_all = groups_any = groups_every = 0
+    groups_all = groups_any = groups_every = pairs_explain = 0
     for trans_id, ids in members.items():
         # explains[i]: the decode of member i reproduces every member's goal.
         explains = []
@@ -148,6 +152,7 @@ def execution_metrics(programs, samples, geometry):
         groups_all += all(verdicts[i] == OK for i in ids)
         groups_any += any(explains)
         groups_every += all(explains)
+        pairs_explain += sum(explains)
 
     def rate(k, n):
         return 100.0 * k / n if n else 0.0
@@ -157,6 +162,7 @@ def execution_metrics(programs, samples, geometry):
         "sample": rate(sum(v == OK for v in verdicts.values()), len(verdicts)),
         "group_all": rate(groups_all, n_groups),
         "cross_pairs": rate(cross, n_cross),
+        "pair_explains_group": rate(pairs_explain, len(verdicts)),
         "group_any_explains_all": rate(groups_any, n_groups),
         "group_every_explains_all": rate(groups_every, n_groups),
         "n_samples": len(verdicts),
@@ -171,7 +177,8 @@ def format_metrics(metrics):
     """One log line of execution_metrics."""
     counts = ", ".join("{} {}".format(r, metrics["reasons"][r]) for r in REASONS if metrics["reasons"][r])
     return ("Execution: per pair {sample:.1f} - all members of a group {group_all:.1f} - "
-            "cross-member pairs {cross_pairs:.1f} - one decode explains its group {group_any_explains_all:.1f} - "
+            "cross-member pairs {cross_pairs:.1f} - pairs whose decode explains its group {pair_explains_group:.1f} - "
+            "one decode explains its group {group_any_explains_all:.1f} - "
             "every decode explains its group {group_every_explains_all:.1f} "
             "({n_samples} pairs, {n_groups} groups, {n_cross_pairs} cross pairs; {counts})").format(
                 counts=counts, **metrics)

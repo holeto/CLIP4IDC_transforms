@@ -9,14 +9,16 @@ layout: `idx` is a unique running id per sample, `trans_id` is shared by all mem
 and `split.json` splits whole transformations, so the splits are cut by `n_samples`.
 
 `trans_id` is the generator's group index, not the content: if the same transformation is drawn twice,
-the two groups get different `trans_id`s. `transformation_key` identifies the content instead, and every
-sample gets a `target_id` (one per distinct key, shared across splits), which the contrastive loss and
-the group-level retrieval metric use.
+the two groups get different `trans_id`s. A key identifies the content instead, and every sample gets a
+`target_id` (one per distinct key, shared across splits), which the contrastive loss and the group-level
+retrieval metric use. The key follows the target: `transformation_key` (the text) for the text target,
+`program_key` (the grammar program) for the grammar target. They differ for in/out moves, whose text
+keeps the direction while the program does not, so two texts can be one program.
 
 Two evaluation setups, chosen with --test_transformation_generalization:
 - scene generalization (default): a transformation may appear in several splits, on different scenes;
   the loader logs how many transformations of val/test also occur in train.
-- transformation generalization (flag set): no transformation may appear in two splits.
+- transformation generalization (flag set): no transformation (by the key) may appear in two splits.
 In both, no initial scene may appear in two splits.
 """
 import json
@@ -56,17 +58,53 @@ def transformation_key(transformations):
     return transformation_to_text(transformations)
 
 
+def transformation_program(transformations):
+    """Grammar program [(descriptor, action)] of the steps of a converted data.jsonl row.
+
+    obj_key spells the stage-0 descriptor as size_color_material_shape, the order of the grammar's R.
+    Actions are written as the grammar writes them: attr.value, position.<direction>.<n> for inner
+    moves, position.in / position.out (no direction) for in- and out-moves.
+    """
+    program = []
+    for trans in transformations:
+        desc = tuple(trans["obj_key"].split("_"))
+        if trans["attr"] != "position":
+            action = "{}.{}".format(trans["attr"], trans["val"])
+        elif trans["type"] in ("in", "out"):
+            action = "position." + trans["type"]
+        else:
+            direction, n = trans["val"]
+            action = "position.{}.{}".format(direction, n)
+        program.append((desc, action))
+    return program
+
+
+def program_key(transformations):
+    """Identity of a transformation for the grammar target: its program as a tuple.
+
+    The steps are in the generator's canonical order, so equal programs give equal keys.
+    """
+    return tuple(transformation_program(transformations))
+
+
+# Keys selectable in load_trance_split, by the target they belong to.
+KEYS = {"text": transformation_key, "program": program_key}
+
+
 def load_trance_split(data_path, subset, initial_camera="Camera_Center", final_camera="Camera_Center",
-                      test_transformation_generalization=False):
+                      test_transformation_generalization=False, key="text"):
     """Samples of one split as a list of dicts, in the order of data.jsonl.
 
     Each sample: sample_id (str of the unique idx), trans_id, member, target_id, text, bef_image,
     aft_image (file names inside the image directory), transformations (the row's steps), objects
     (its stage-0 objects) and final_objects (those of its last state). target_id numbers the distinct
-    `transformation_key`s of the whole file in order of first appearance, so it is the same in every split.
-    With test_transformation_generalization, a transformation in two splits is an error; otherwise the
-    share of the split's transformations that also occur in train is logged (for val and test).
+    keys of the whole file in order of first appearance, so it is the same in every split; `key` names
+    the key function in KEYS ("text" or "program", see the module docstring). With
+    test_transformation_generalization, a transformation (by that key) in two splits is an error;
+    otherwise the share of the split's transformations that also occur in train is logged (for val and
+    test).
     """
+    key_of = KEYS[key]
     with open(os.path.join(data_path, "data.jsonl"), "r") as fp:
         rows = [json.loads(line) for line in fp if line.strip()]
     with open(os.path.join(data_path, "split.json"), "r") as fp:
@@ -87,7 +125,7 @@ def load_trance_split(data_path, subset, initial_camera="Camera_Center", final_c
     samples = []
     for row, name in zip(rows, split_of_row):
         text = transformation_to_text(row["transformations"])
-        key = transformation_key(row["transformations"])
+        key = key_of(row["transformations"])
         target_id = target_id_of_key.setdefault(key, len(target_id_of_key))
         splits_of_trans[row["trans_id"]].add(name)
         texts_of_trans[row["trans_id"]].add(text)
@@ -129,9 +167,9 @@ def load_trance_split(data_path, subset, initial_camera="Camera_Center", final_c
                 "transformation {!r} (trans_ids {}) spans splits {}; split by transformation, not by trans_id".format(
                     key, sorted(trans_of_key[key]), sorted(names))
     elif subset != "train" and samples:
-        keys = {transformation_key(s["transformations"]) for s in samples}
+        keys = {key_of(s["transformations"]) for s in samples}
         shared = sum("train" in splits_of_key[key] for key in keys)
-        logger.info("%.0f%% of transformations in the %s set (%d of %d) are contained in the train set",
-                    100. * shared / len(keys), subset, shared, len(keys))
+        logger.info("%.0f%% of transformations in the %s set (%d of %d) are contained in the train set "
+                    "(key: %s)", 100. * shared / len(keys), subset, shared, len(keys), key)
 
     return samples

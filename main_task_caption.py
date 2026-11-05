@@ -15,7 +15,7 @@ import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling import CLIP4IDC
-from modules.grammar_args import add_grammar_args
+from modules.grammar_args import GRAMMAR_SELECT_METRICS, add_grammar_args
 from dataloaders.trance_util import add_trance_args
 from modules.optimization import BertAdam
 from modules.beam import Beam
@@ -152,6 +152,15 @@ def get_args(description='CLIP4IDC on Captioning Task'):
     parser.add_argument("--execution_oracle", action="store_true",
                         help="Grammar target, check of the execution metrics: decode as usual, then score the true "
                              "derivations in place of the decoded ones (100%% on consistent data).")
+    parser.add_argument("--group_pooling_eval", action="store_true",
+                        help="Grammar target: also decode the mean of the latents of every group's pairs (once per "
+                             "member, under that member's mask) and score it with the execution metrics (pooled_*).")
+    parser.add_argument("--select_split", default="test", choices=["test", "val"],
+                        help="Split whose score selects the best epoch and drives the early stop. With val, test is "
+                             "evaluated and logged every epoch too (default test, as upstream).")
+    parser.add_argument("--grammar_select_metric", default="pair_explains_group", choices=GRAMMAR_SELECT_METRICS,
+                        help="Grammar target: metric that selects the best epoch (see modules/trance_execution.py; "
+                             "exact = exact match of the derivation).")
     add_trance_args(parser)
     parser.add_argument("--config", default=None, type=str,
                         help="YAML file with defaults (sections common, adaptation, finetuning; see util.py)")
@@ -572,12 +581,18 @@ def greedy_decode(args, model, tokenizer, input_ids, segment_ids, input_mask, vi
 
     return input_caption_ids[:, 1:].tolist()
 
-def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
-    """Decodes every test pair under --grammar_mask and compares it with the true derivation.
+def hyp_file(args, split, epoch):
+    # Decodes of the test split keep the upstream name hyp_ep_<epoch>.json.
+    return os.path.join(args.output_dir, "hyp_{}ep_{}.json".format("" if split == "test" else split + "_", epoch))
 
-    Also logs the execution metrics (modules/trance_execution.py): whether the decoded transformation turns
-    the pair's initial scene into its final one, and across the members of each group.
-    Writes hyp_ep_<epoch>.json and returns the exact-match rate in %, which selects the best checkpoint.
+def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None, split="test"):
+    """Decodes every pair of the split under --grammar_mask and compares it with the true derivation.
+
+    Also computes the execution metrics (modules/trance_execution.py): whether the decoded transformation
+    turns the pair's initial scene into its final one, and across the members of each group.
+    Writes the decodes to hyp_file and returns the metrics: exact, valid, valid_group, complete (in %) and those of
+    trance_execution.execution_metrics without the per-sample verdicts; with --group_pooling_eval also those of the
+    decoded group centroids (eval_group_pooling), prefixed pooled_.
     """
     from modules import trance_execution, trance_grammar
 
@@ -587,7 +602,7 @@ def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
         model = model.to(device)
     dataset = test_dataloader.dataset
 
-    results, programs = [], {}
+    results, programs, latents = [], {}, {}
     model.eval()
     with torch.no_grad():
         for batch in test_dataloader:
@@ -595,36 +610,107 @@ def eval_epoch_grammar(args, model, test_dataloader, device, epoch=None):
             _, _, _, bef_image, aft_image, image_mask = (t.to(device, non_blocking=True) for t in batch[:-1])
             maskers = [trance_grammar.make_masker(args.grammar_mask, dataset.members_of(sample_id), dataset.geometry)
                        for sample_id in sample_ids]
-            decoded = model.decode_rules(bef_image, aft_image, image_mask, maskers).tolist()
+            z = model.pair_latents(bef_image, aft_image, image_mask)
+            if args.group_pooling_eval:
+                latents.update(zip(sample_ids, z.float().cpu()))
+            decoded = model.decode_latents(z, maskers).tolist()
             if args.execution_oracle:
                 decoded = [dataset.rules_of(sample_id).tolist() for sample_id in sample_ids]
             for sample_id, rules, masker in zip(sample_ids, decoded, maskers):
                 # A decode the mask did not finish is incomplete; the oracle's are complete.
                 done = masker.done or args.execution_oracle
                 program = trance_grammar.program_of_derivation(rules) if done else None
-                # valid in every member's scene, whichever mask decoded it
+                # Valid in the scenes of the mask (--init_desc_scope), and in
+                # every member's scene, whichever mask decoded it.
                 valid = program is not None and trance_grammar.accepts(
                     dataset.members_of(sample_id), rules, dataset.geometry)
+                valid_group = program is not None and trance_grammar.accepts(
+                    dataset.group_members_of(sample_id), rules, dataset.geometry)
                 programs[sample_id] = program
                 results.append({"image_id": sample_id, "rules": rules,
                                 "program": None if program is None else trance_grammar.program_text(program),
-                                "complete": program is not None, "valid": valid,
+                                "complete": program is not None, "valid": valid, "valid_group": valid_group,
                                 "exact": rules == dataset.rules_of(sample_id).tolist()})
 
     execution = trance_execution.execution_metrics(programs, dataset.execution_samples(), dataset.geometry)
     for result in results:
         result["execution"] = execution["verdicts"][result["image_id"]]
-    json.dump(results, open(os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch), "w"), indent=1)
-    rate = {key: 100.0 * sum(r[key] for r in results) / len(results) for key in ["exact", "valid", "complete"]}
-    logger.info(">>>  Exact match: {:.1f} - Valid in every scene: {:.1f} - Complete: {:.1f} ({} pairs, {} mask{})".format(
-        rate["exact"], rate["valid"], rate["complete"], len(results), args.grammar_mask,
+    rate = {key: 100.0 * sum(r[key] for r in results) / len(results)
+            for key in ["exact", "valid", "valid_group", "complete"]}
+    logger.info(">>>  {}: Exact match: {:.1f} - Valid in the mask's scenes: {:.1f} - Valid in every member's scene: {:.1f} - "
+                "Complete: {:.1f} ({} pairs, {} mask, {} scope{})".format(
+        split, rate["exact"], rate["valid"], rate["valid_group"], rate["complete"], len(results), args.grammar_mask,
+        args.init_desc_scope,
         ", ORACLE: true derivations scored" if args.execution_oracle else ""))
-    logger.info(">>>  " + trance_execution.format_metrics(execution))
-    return rate["exact"]
+    logger.info(">>>  {}: {}".format(split, trance_execution.format_metrics(execution)))
+    metrics = dict(rate, **{key: value for key, value in execution.items() if key != "verdicts"})
+    metrics["reasons"] = dict(metrics["reasons"])
+    if args.group_pooling_eval:
+        pooled = eval_group_pooling(args, model, dataset, latents, results, device, split)
+        metrics.update({"pooled_" + key: value for key, value in pooled.items()})
+    json.dump(results, open(hyp_file(args, split, epoch), "w"), indent=1)
+    return metrics
 
-def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, test_set=None, epoch=None):
+def eval_group_pooling(args, model, dataset, latents, results, device, split):
+    """Decodes the centroid of every group's pair latents and scores it with the execution metrics.
+
+    If the latent space has a meaningful geometry, the mean of the latents of one transformation's pairs identifies
+    the transformation. The centroid is decoded once per member, under that member's mask (--grammar_mask,
+    --init_desc_scope), so the metrics count members as for the per-pair decodes: pair_explains_group is the share of
+    members whose mask-decode of the centroid reproduces every member of the group. Adds pooled_program and
+    pooled_execution to every result and returns the metrics of trance_execution.execution_metrics without the
+    verdicts, plus the spread of the latents: mean cosine of a member to its centroid and the norm of the centroid
+    relative to the mean norm of its members. Saves the latents to latents_<split>.npz (sample_ids, trans_ids, z) in
+    --output_dir for analyses of the latent space.
+    """
+    from modules import trance_execution, trance_grammar
+
+    order = list(latents)
+    np.savez(os.path.join(args.output_dir, "latents_{}.npz".format(split)), sample_ids=np.array(order),
+             trans_ids=np.array([dataset.trans_id_of[i] for i in order]),
+             z=torch.stack([latents[i] for i in order]).numpy())
+
+    groups = {}
+    for sample_id in latents:
+        groups.setdefault(dataset.trans_id_of[sample_id], []).append(sample_id)
+    centroid, cosines, norm_ratios = {}, [], []
+    for ids in groups.values():
+        z = torch.stack([latents[sample_id] for sample_id in ids])
+        mean = z.mean(0)
+        cosines += torch.nn.functional.cosine_similarity(z, mean.unsqueeze(0)).tolist()
+        norm_ratios.append(float(mean.norm() / z.norm(dim=1).mean()))
+        for sample_id in ids:
+            centroid[sample_id] = mean
+
+    programs = {}
+    sample_ids = list(latents)
+    with torch.no_grad():
+        for start in range(0, len(sample_ids), args.batch_size_val):
+            chunk = sample_ids[start:start + args.batch_size_val]
+            maskers = [trance_grammar.make_masker(args.grammar_mask, dataset.members_of(sample_id), dataset.geometry)
+                       for sample_id in chunk]
+            z = torch.stack([centroid[sample_id] for sample_id in chunk]).to(device)
+            for sample_id, rules, masker in zip(chunk, model.decode_latents(z, maskers).tolist(), maskers):
+                programs[sample_id] = trance_grammar.program_of_derivation(rules) if masker.done else None
+
+    execution = trance_execution.execution_metrics(programs, dataset.execution_samples(), dataset.geometry)
+    for result in results:
+        program = programs[result["image_id"]]
+        result["pooled_program"] = None if program is None else trance_grammar.program_text(program)
+        result["pooled_execution"] = execution["verdicts"][result["image_id"]]
+    metrics = {key: value for key, value in execution.items() if key != "verdicts"}
+    metrics["reasons"] = dict(metrics["reasons"])
+    metrics["cos_to_centroid"] = sum(cosines) / len(cosines)
+    metrics["centroid_norm_ratio"] = sum(norm_ratios) / len(norm_ratios)
+    logger.info(">>>  pooled (mean of each group's pair latents, decoded under each member's mask): {} - mean cosine "
+                "of a pair to its centroid {:.3f}, centroid norm / mean member norm {:.3f}".format(
+        trance_execution.format_metrics(execution), metrics["cos_to_centroid"], metrics["centroid_norm_ratio"]))
+    return metrics
+
+def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, test_set=None, epoch=None, split="test"):
+    """Decodes the split and scores it; returns a dict of metrics (see selection_score)."""
     if args.target == "grammar":
-        return eval_epoch_grammar(args, model, test_dataloader, device, epoch=epoch)
+        return eval_epoch_grammar(args, model, test_dataloader, device, epoch=epoch, split=split)
     if hasattr(model, 'module'):
         model = model.module.to(device)
     else:
@@ -680,20 +766,22 @@ def eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, test_set=
                     all_nc_result_lists.append(new_decode_item)
 
     total_results = all_result_lists + all_nc_result_lists
-    json.dump(total_results, open(os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch), "w"))
-    assert os.path.exists(os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch))
+    json.dump(total_results, open(hyp_file(args, split, epoch), "w"))
+    assert os.path.exists(hyp_file(args, split, epoch))
 
     # Evaluate
     metrics_nlg = score_generation(os.path.join(args.gt_dir, "%s_total_change_captions_reformat.json" % args.datatype),
-                                   os.path.join(args.output_dir, "hyp_ep_%s.json" % epoch))
+                                   hyp_file(args, split, epoch))
 
+    logger.info(">>>  %s", split)
     logger.info(">>>  BLEU_1: {:.4f}, BLEU_2: {:.4f}, BLEU_3: {:.4f}, BLEU_4: {:.4f}".
                 format(metrics_nlg["Bleu_1"], metrics_nlg["Bleu_2"], metrics_nlg["Bleu_3"], metrics_nlg["Bleu_4"]))
     logger.info(">>>  METEOR: {:.4f}, ROUGE_L: {:.4f}, CIDEr: {:.4f}".format(metrics_nlg["METEOR"], metrics_nlg["ROUGE_L"], metrics_nlg["CIDEr"]))
 
-    # Bleu_4 = metrics_nlg["Bleu_4"]
-    CIDEr = metrics_nlg["CIDEr"]
-    return CIDEr
+    return {key: float(value) for key, value in metrics_nlg.items()}
+
+def selection_name(args):
+    return args.grammar_select_metric if args.target == "grammar" else "CIDEr"
 
 def main():
     global logger
@@ -783,7 +871,8 @@ def main():
             logger.info("  Batch size = %d", args.batch_size)
             logger.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
 
-        best_score = 0.00001
+        # Below every score, so that the first epoch is the best so far even at 0.
+        best_score = -1.0
         best_output_model_file = "None"
         resumed_epoch, global_step, early_stop = 0, 0, 0
         if resume_state is not None:
@@ -810,18 +899,25 @@ def main():
 
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
-                ## Run on val dataset, this process is *TIME-consuming*.
-                # logger.info("Eval on val dataset")
-                # R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
-
-                CIDEr = eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, epoch=epoch)
+                # The selecting split first; with val, test is only reported.
+                splits = {"val": val_dataloader, "test": test_dataloader} if args.select_split == "val" \
+                    else {"test": test_dataloader}
+                metrics = {split: eval_epoch(args, model, loader, tokenizer, device, n_gpu, epoch=epoch, split=split)
+                           for split, loader in splits.items()}
+                score = metrics[args.select_split][selection_name(args)]
+                # One line per evaluated epoch; a resumed run repeats an epoch whose
+                # training state was not saved, so the last line of an epoch counts.
+                with open(os.path.join(args.output_dir, "metrics.jsonl"), "a") as fp:
+                    fp.write(json.dumps({"epoch": epoch, "train_loss": tr_loss, "global_step": global_step,
+                                         "select": [args.select_split, selection_name(args), score],
+                                         **metrics}) + "\n")
                 early_stop += 1
-                if best_score <= CIDEr:
-                    best_score = CIDEr
+                if best_score <= score:
+                    best_score = score
                     best_output_model_file = output_model_file
                     early_stop = 0
-                logger.info("The best model is: {}, the {} is: {:.4f}".format(
-                    best_output_model_file, "exact match" if args.target == "grammar" else "CIDEr", best_score))
+                logger.info("The best model is: {}, the {} on {} is: {:.4f}".format(
+                    best_output_model_file, selection_name(args), args.select_split, best_score))
                 atomic_save({"epoch": epoch, "optimizer_state_dict": optimizer.state_dict(), "loss": tr_loss,
                              "global_step": global_step, "best_score": best_score,
                              "best_output_model_file": best_output_model_file, "early_stop": early_stop,
@@ -832,7 +928,13 @@ def main():
 
     elif args.do_eval:
         if args.local_rank == 0:
-            eval_epoch(args, model, test_dataloader, tokenizer, device, n_gpu, epoch="eval")
+            # With --select_split val, val is decoded too, as in training.
+            splits = {"val": val_dataloader, "test": test_dataloader} if args.select_split == "val" \
+                else {"test": test_dataloader}
+            metrics = {split: eval_epoch(args, model, loader, tokenizer, device, n_gpu, epoch="eval", split=split)
+                       for split, loader in splits.items()}
+            with open(os.path.join(args.output_dir, "metrics_eval.json"), "w") as fp:
+                json.dump({"init_model": args.init_model, **metrics}, fp, indent=1)
 
 if __name__ == "__main__":
     main()

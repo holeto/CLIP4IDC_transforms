@@ -95,6 +95,20 @@ def test_in_and_out():
     assert _check(_program((CUBE, "position.in")), {}) == te.INVALID_STEP
 
 
+def test_in_at_exact_contact():
+    # The cylinder comes in at (-20, -13) or (-20, 7); at (-20, 7) the sphere
+    # is at exactly 6 + 4 + 1. The generator's move test lets it land there,
+    # although the float test of its recorded candidates calls it blocked.
+    scene = [_obj(CYLINDER, (-40, -13)), _obj(SPHERE, (-20, 18))]
+    assert GEOMETRY.overlaps((-20, 7), "large", (-20, 18), "medium")
+    move_in = _program((CYLINDER, "position.in"))
+    assert _check(move_in, {0: {"position": [-20, 7]}}, scene) == te.OK
+    assert _check(move_in, {0: {"position": [-20, -13]}}, scene) == te.OK
+    # One cell closer is a real overlap.
+    scene[1]["position"] = [-20, 17]
+    assert _check(move_in, {0: {"position": [-20, 7]}}, scene) == te.WRONG_GOAL
+
+
 def test_failures_are_verdicts():
     assert te.check(None, SCENE, SCENE, GEOMETRY) == te.NOT_PARSED
     assert _check(_program(("small red metal sphere", "color.green")), {}) == te.NO_OBJECT
@@ -126,9 +140,12 @@ def test_execution_metrics():
     # Pairs (a,a), (a,b) hold; (b,a), (b,b), (c,c) fail.
     assert m["n_cross_pairs"] == 5 and m["cross_pairs"] == 40
     assert m["group_any_explains_all"] == 50 and m["group_every_explains_all"] == 0
+    # Only a's decode reproduces both goals of its group.
+    assert abs(m["pair_explains_group"] - 100. / 3) < 1e-9
     programs["b"] = programs["a"]
     m = te.execution_metrics(programs, samples, GEOMETRY)
     assert m["group_all"] == 50 and m["group_every_explains_all"] == 50
+    assert abs(m["pair_explains_group"] - 200. / 3) < 1e-9
     assert "per pair 66.7" in te.format_metrics(m)
 
 
